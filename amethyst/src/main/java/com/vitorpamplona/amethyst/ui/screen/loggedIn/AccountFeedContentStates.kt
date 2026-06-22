@@ -20,12 +20,14 @@
  */
 package com.vitorpamplona.amethyst.ui.screen.loggedIn
 
+import com.vitorpamplona.amethyst.Amethyst
 import com.vitorpamplona.amethyst.commons.ui.feeds.FeedContentState
 import com.vitorpamplona.amethyst.model.Account
 import com.vitorpamplona.amethyst.model.LocalCache
 import com.vitorpamplona.amethyst.model.Note
 import com.vitorpamplona.amethyst.model.TopFilter
 import com.vitorpamplona.amethyst.service.checkNotInMainThread
+import com.vitorpamplona.amethyst.service.notifications.NotificationDiskStore
 import com.vitorpamplona.amethyst.ui.feeds.ChannelFeedContentState
 import com.vitorpamplona.amethyst.ui.screen.TopNavFilterState
 import com.vitorpamplona.amethyst.ui.screen.loggedIn.articles.dal.ArticlesFeedFilter
@@ -71,6 +73,7 @@ import com.vitorpamplona.amethyst.ui.screen.loggedIn.softwareapps.dal.SoftwareAp
 import com.vitorpamplona.amethyst.ui.screen.loggedIn.video.dal.VideoFeedFilter
 import com.vitorpamplona.amethyst.ui.screen.loggedIn.webBookmarks.dal.WebBookmarkFeedFilter
 import com.vitorpamplona.amethyst.ui.screen.loggedIn.workouts.dal.WorkoutFeedFilter
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.drop
@@ -129,6 +132,18 @@ class AccountFeedContentStates(
     val notificationsFollowing = CardFeedContentState(NotificationFeedFilter(account, TopFilter.AllFollows), scope)
     val notificationsEveryone = CardFeedContentState(NotificationFeedFilter(account, TopFilter.Global), scope)
 
+    // On-disk store for the events behind notification cards. Events otherwise
+    // live only in memory and are re-fetched from relays every cold start, so
+    // this lets notifications render instantly on launch and survive relays
+    // pruning them. See amethyst/plans/2026-06-22-notification-local-store.md.
+    private val notificationStore =
+        NotificationDiskStore(
+            File(
+                Amethyst.instance.appContext.filesDir,
+                "accounts/${account.userProfile().pubkeyHex}/notifications.jsonl",
+            ),
+        )
+
     val notificationsOpenPolls = OpenPollsState(account, scope)
     val notificationSummary = NotificationSummaryState(account)
 
@@ -178,10 +193,36 @@ class AccountFeedContentStates(
                 notificationsEveryone.invalidateData()
             }
         }
+
+        // Cold-start: seed the in-memory cache from the on-disk notification
+        // store so the feed renders immediately, before any relay answers, and
+        // shows history relays may no longer serve. Events were verified before
+        // they were persisted, so they are consumed as already-verified.
+        scope.launch(Dispatchers.IO) {
+            val persisted = notificationStore.load()
+            if (persisted.isNotEmpty()) {
+                persisted.forEach { LocalCache.justConsume(it, null, true) }
+                notifications.invalidateData()
+                if (account.settings.splitNotificationsEnabled.value) {
+                    notificationsFollowing.invalidateData()
+                    notificationsEveryone.invalidateData()
+                }
+            }
+        }
     }
 
     suspend fun init() {
         notificationSummary.initializeSuspend()
+    }
+
+    // Persist the events behind incoming notification cards. Uses the Global
+    // filter so the stored set is the union across modes (it is the broadest
+    // acceptance); the store dedups and bounds itself by count + age.
+    private fun persistAcceptedNotifications(newNotes: Set<Note>) {
+        val filter = notificationsEveryone.localFilter as? NotificationFeedFilter ?: return
+        val accepted = filter.applyFilter(newNotes)
+        if (accepted.isEmpty()) return
+        notificationStore.persist(accepted.mapNotNull { it.event })
     }
 
     fun updateFeedsWith(newNotes: Set<Note>) {
@@ -239,6 +280,8 @@ class AccountFeedContentStates(
             notificationsEveryone.updateFeedWith(newNotes)
         }
         notificationSummary.invalidateInsertData(newNotes)
+
+        persistAcceptedNotifications(newNotes)
 
         drafts.updateFeedWith(newNotes)
 
