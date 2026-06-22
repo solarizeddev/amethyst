@@ -51,7 +51,12 @@ class AccountNotificationsEoseFromRandomRelaysManager(
         key: AccountQueryState,
         since: SincePerRelayMap?,
     ): List<RelayBasedFilter> {
-        // only loads this after the feed is built
+        // Keep a recent floor on the random-relay fan-out. Unlike the inbox path
+        // (a handful of relays bounded by `limit`), this queries every relay in
+        // `followsPerRelay` — potentially hundreds — so a null `since` would make
+        // each return its newest-of-all-time across four filters, a large on-device
+        // verification cost on cold start. The inbox path already backfills the
+        // user's own history; this supplementary sweep only needs recent stragglers.
         val defaultSince = key.feedContentStates.notifications.lastNoteCreatedAtIfFilled() ?: TimeUtils.oneWeekAgo()
         return (key.account.followsPerRelay.value.keys - key.account.notificationRelays.flow.value).flatMap {
             val since = since?.get(it)?.time ?: defaultSince
